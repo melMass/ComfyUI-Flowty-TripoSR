@@ -104,6 +104,106 @@ class TripoSRModelLoader:
         return (self.initialized_model,)
 
 
+class TripoSRTextureSampler:
+    def __init__(self):
+        self.initialized_model = None
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("TRIPOSR_MODEL",),
+                "reference_image": ("IMAGE",),
+                "n_views": ("INT", {"default": 1}),
+                "elevation_deg": ("FLOAT", {"default": 0.0, "step": 0.01}),
+                "camera_distance": ("FLOAT", {"default": 1.9}),
+                "fovy_deg": ("FLOAT", {"default": 40.0}),
+                "width": ("INT", {"default": 512}),
+                "height": ("INT", {"default": 512}),
+            },
+            "optional": {"reference_mask": ("MASK",)},
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "sample"
+    CATEGORY = "Flowty TripoSR"
+
+    def sample(
+        self,
+        model: TSR,
+        reference_image: torch.Tensor,
+        n_views: int,
+        elevation_deg: float,
+        camera_distance: float,
+        fovy_deg: float,
+        width: int,
+        height: int,
+        reference_mask=None,
+    ):
+        device = get_torch_device()
+
+        if not torch.cuda.is_available():
+            device = "cpu"
+
+        batch_size = reference_image.shape[0]
+        meshes_batch = []
+        textures = []
+        for img_idx in range(batch_size):
+            image = reference_image[img_idx]
+
+            # If reference_mask is provided and has the same batch size as reference_image,
+            # use the corresponding mask for the current image; otherwise, use the first mask
+            if reference_mask is not None:
+                if reference_mask.shape[0] == batch_size:
+                    mask = reference_mask[img_idx].unsqueeze(2)
+                else:
+                    mask = reference_mask[0].unsqueeze(2)
+                image = torch.cat((image, mask), dim=2).detach().cpu().numpy()
+            else:
+                image = image.detach().cpu().numpy()
+
+            image = Image.fromarray(np.clip(255.0 * image, 0, 255).astype(np.uint8))
+
+            if reference_mask is not None:
+                image = fill_background(image)
+
+            image = image.convert("RGB")
+            scene_codes = model([image], device)
+
+            texture = model.render(
+                scene_codes,
+                n_views,
+                elevation_deg,
+                camera_distance,
+                fovy_deg,
+                height,
+                width,
+                return_type="pt",
+            )
+
+            flat_render = [
+                tensor.unsqueeze(0)
+                for sublist in model.render(
+                    scene_codes,
+                    n_views,
+                    elevation_deg,
+                    camera_distance,
+                    fovy_deg,
+                    height,
+                    width,
+                    return_type="pt",
+                )
+                for tensor in sublist
+            ]
+            print(flat_render[0].shape)
+
+            textures.append(torch.cat(flat_render, dim=0))
+
+            print(textures[-1].shape)
+
+        return (torch.cat(textures, dim=0),)
+
+
 class TripoSRSampler:
     def __init__(self):
         self.initialized_model = None
@@ -254,6 +354,7 @@ class TripoSRMeshSave:
             raise ValueError("No output folder was found")
 
         full_paths = []
+
         for batch_number, single_mesh in enumerate(mesh):
             filename_with_batch_num = filename.replace("%batch_num%", str(batch_number))
             file = f"{filename_with_batch_num}_{counter:05}_.obj"
@@ -309,6 +410,7 @@ NODE_CLASS_MAPPINGS = {
     "TripoSRSampler": TripoSRSampler,
     "TripoSRMeshSave": TripoSRMeshSave,
     "TripoSRViewer": TripoSRViewer,
+    "TripoSRTextureSampler": TripoSRTextureSampler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -316,6 +418,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TripoSRSampler": "TripoSR Sampler",
     "TripoSRMeshSave": "TripoSR Mesh Save",
     "TripoSRViewer": "TripoSR Viewer",
+    "TripoSRTextureSampler": "TripoSR Texture Sampler",
 }
 
 WEB_DIRECTORY = "./web"
