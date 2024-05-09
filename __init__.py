@@ -1,5 +1,6 @@
 import sys
 from os import path
+import io
 
 sys.path.insert(0, path.dirname(__file__))
 from folder_paths import (
@@ -9,6 +10,8 @@ from folder_paths import (
     get_output_directory,
 )
 from comfy.model_management import get_torch_device
+import comfy.utils
+import server
 from tsr.system import TSR
 from PIL import Image
 import numpy as np
@@ -20,6 +23,50 @@ def fill_background(image):
     image = image[:, :, :3] * image[:, :, 3:4] + (1 - image[:, :, 3:4]) * 0.5
     image = Image.fromarray((image * 255.0).astype(np.uint8))
     return image
+
+
+def restore_hook(hook):
+    print("Restoring hook")
+    comfy.utils.set_progress_bar_global_hook(hook)
+
+
+def setup_hook(server):
+    """Setup a hook for the server to support sending obj using websocket."""
+
+    if comfy.utils.PROGRESS_BAR_HOOK is None:
+        print(
+            "Not sure what do to, aborting hook hijack, sending mesh using websocket won't work"
+        )
+        return
+
+    print("Setting up hook")
+    old_hook = comfy.utils.PROGRESS_BAR_HOOK
+
+    def hook(value, total, preview_image):
+        if preview_image is None or (preview_image and preview_image[0] not in ["OBJ"]):
+            old_hook(value, total, preview_image)
+            return
+
+        comfy.model_management.throw_exception_if_processing_interrupted()
+        progress = {
+            "value": value,
+            "max": total,
+            "prompt_id": server.last_prompt_id,
+            "node": server.last_node_id,
+        }
+
+        server.send_sync("progress", progress, server.client_id)
+
+        print("Sending mesh")
+        # TODO: try to send bytes directly
+        server.send_sync(
+            "obj_export",  # 3,  # comfy uses 1 & 2
+            {"obj_export": preview_image[1]},
+            server.client_id,
+        )
+
+    comfy.utils.set_progress_bar_global_hook(hook)
+    return old_hook
 
 
 class TripoSRModelLoader:
@@ -82,10 +129,10 @@ class TripoSRSampler:
 
     def sample(
         self,
-        model,
-        reference_image,
-        geometry_resolution,
-        threshold,
+        model: TSR,
+        reference_image: torch.Tensor,
+        geometry_resolution: int,
+        threshold: float,
         reference_mask=None,
     ):
         device = get_torch_device()
@@ -132,14 +179,15 @@ class TripoSRMeshSave:
                 "mesh": ("MESH",),
                 "prefix": ("STRING", {"default": "mesh_%batch_num%"}),
                 "save_location": (
-                    ["custom", "comfy_output_dir"],
+                    ["custom (server)", "comfy_output_dir", "websocket"],
                     {"default": "comfy_output_dir"},
                 ),
                 "save_path": ("STRING", {"default": ""}),
             }
         }
 
-    RETURN_TYPES = ()
+    RETURN_TYPES = ("STRING",)
+    OUTPUT_IS_LIST = (True,)
     OUTPUT_NODE = True
     FUNCTION = "save"
     CATEGORY = "Flowty TripoSR"
@@ -154,16 +202,58 @@ class TripoSRMeshSave:
                 full_output_folder, filename, counter, subfolder, filename_prefix = (
                     get_save_image_path(prefix, get_output_directory())
                 )
-            case "custom":
+            case "custom (server)":
                 full_output_folder, filename, counter, subfolder, filename_prefix = (
                     get_save_image_path(prefix, save_path)
                 )
+            case "websocket":
+                sinstance = server.PromptServer.instance
+                if not sinstance:
+                    raise ValueError("No server instance found")
+                old_hook = setup_hook(sinstance)
+                if not old_hook:
+                    raise ValueError("No server hook found")
+                try:
+                    pbar = comfy.utils.ProgressBar(len(mesh))
+                    step = 0
+
+                    for batch_number, single_mesh in enumerate(mesh):
+                        single_mesh.apply_transform(
+                            np.array(
+                                [
+                                    [1, 0, 0, 0],
+                                    [0, 0, 1, 0],
+                                    [0, -1, 0, 0],
+                                    [0, 0, 0, 1],
+                                ]
+                            )
+                        )
+                        mesh_obj = io.BytesIO()
+                        single_mesh.export(mesh_obj, file_type="obj")
+
+                        pbar.update_absolute(
+                            step,
+                            len(mesh),
+                            (
+                                "OBJ",
+                                mesh_obj.getvalue().decode("utf-8"),
+                                None,
+                            ),
+                        )
+                        step += 1
+
+                    return {}
+                except Exception as e:
+                    print(e)
+                finally:
+                    restore_hook(old_hook)
             case _:
                 print("Not handled")
 
         if full_output_folder is None:
             raise ValueError("No output folder was found")
 
+        full_paths = []
         for batch_number, single_mesh in enumerate(mesh):
             filename_with_batch_num = filename.replace("%batch_num%", str(batch_number))
             file = f"{filename_with_batch_num}_{counter:05}_.obj"
@@ -172,7 +262,14 @@ class TripoSRMeshSave:
                 np.array([[1, 0, 0, 0], [0, 0, 1, 0], [0, -1, 0, 0], [0, 0, 0, 1]])
             )
 
-            single_mesh.export(path.join(full_output_folder, file))
+            mesh_path = path.join(full_output_folder, file)
+            single_mesh.export(mesh_path)
+
+            full_paths.append(mesh_path)
+            saved.append({"filename": file, "type": "output", "subfolder": subfolder})
+
+        return {"ui": {"mesh": saved}, "result": (full_paths,)}
+
 
             saved.append({"filename": file, "type": "output", "subfolder": subfolder})
 
